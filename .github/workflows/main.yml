@@ -40,9 +40,14 @@ jobs:
       env:
         ACCESS_TOKEN: ${{ secrets.ACCESS_TOKEN }}
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        GITHUB_ACTOR: ${{ secrets.GITHUB_ACTOR }}
         EXCLUDED: ${{ secrets.EXCLUDED }}
         EXCLUDED_LANGS: ${{ secrets.EXCLUDED_LANGS }}
         EXCLUDE_FORKED_REPOS: true
+        # Make CI use owned-only aggregation to match local runs by default
+        EXCLUDE_CONTRIBS: 'true'
+        # Increase retries so GitHub has more time to compute contributors/traffic
+        MAX_202_RETRIES: '10'
 
     # Commit all changed files to the repository
     - name: Commit to the repo

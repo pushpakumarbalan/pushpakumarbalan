@@ -1,3 +1,4 @@
 requests
 aiohttp
-certificertifi
+certifi
+certifi
