@@ -5,6 +5,8 @@ import os
 import re
 
 import aiohttp
+import ssl
+import certifi
 
 from github_stats import Stats
 
@@ -35,14 +37,65 @@ async def generate_overview(s: Stats) -> None:
     with open("templates/overview.svg", "r") as f:
         output = f.read()
 
-    output = re.sub("{{ name }}", await s.name, output)
-    output = re.sub("{{ stars }}", f"{await s.stargazers:,}", output)
-    output = re.sub("{{ forks }}", f"{await s.forks:,}", output)
-    output = re.sub("{{ contributions }}", f"{await s.total_contributions:,}", output)
-    changed = (await s.lines_changed)[0] + (await s.lines_changed)[1]
+    # Fetch stats with fallbacks so one failing API call doesn't prevent image generation
+    try:
+        name_val = await s.name
+    except Exception:
+        name_val = "Unknown"
+
+    try:
+        stars_val = f"{await s.stargazers:,}"
+    except Exception:
+        stars_val = "0"
+
+    try:
+        forks_val = f"{await s.forks:,}"
+    except Exception:
+        forks_val = "0"
+
+    try:
+        contributions_val = f"{await s.total_contributions:,}"
+    except Exception:
+        contributions_val = "0"
+
+    try:
+        lines = await s.lines_changed
+        changed = lines[0] + lines[1]
+        changed_val = f"{changed:,}"
+    except Exception:
+        changed_val = "N/A"
+
+    try:
+        views_val = f"{await s.views:,}"
+    except Exception:
+        views_val = "0"
+
+    try:
+        repos_val = f"{len(await s.repos):,}"
+    except Exception:
+        repos_val = "0"
+
+    # New stats with fallbacks
+    try:
+        pull_requests_val = f"{await s.total_pull_requests:,}"
+    except Exception:
+        pull_requests_val = "0"
+
+    try:
+        issues_val = f"{await s.total_issues_created:,}"
+    except Exception:
+        issues_val = "0"
+
+    output = re.sub("{{ name }}", name_val, output)
+    output = re.sub("{{ stars }}", stars_val, output)
+    output = re.sub("{{ forks }}", forks_val, output)
+    output = re.sub("{{ contributions }}", contributions_val, output)
     # output = re.sub("{{ lines_changed }}", f"{changed:,}", output)
-    output = re.sub("{{ views }}", f"{await s.views:,}", output)
-    output = re.sub("{{ repos }}", f"{len(await s.repos):,}", output)
+    output = re.sub("{{ views }}", views_val, output)
+    output = re.sub("{{ repos }}", repos_val, output)
+    # New stats
+    output = re.sub("{{ pull_requests }}", pull_requests_val, output)
+    output = re.sub("{{ issues }}", issues_val, output)
 
     generate_output_folder()
     with open("generated/overview.svg", "w") as f:
@@ -120,7 +173,14 @@ async def main() -> None:
         not not raw_ignore_forked_repos
         and raw_ignore_forked_repos.strip().lower() != "false"
     )
-    async with aiohttp.ClientSession() as session:
+    raw_ignore_contribs = os.getenv("EXCLUDE_CONTRIBS") or os.getenv("EXCLUDE_CONTRIBUTED")
+    ignore_contrib_repos = (
+        not not raw_ignore_contribs and str(raw_ignore_contribs).strip().lower() != "false"
+    )
+    # Use certifi's CA bundle for aiohttp to avoid macOS venv SSL errors
+    ssl_context = ssl.create_default_context(cafile=certifi.where())
+    connector = aiohttp.TCPConnector(ssl=ssl_context)
+    async with aiohttp.ClientSession(connector=connector) as session:
         s = Stats(
             user,
             access_token,
@@ -128,6 +188,7 @@ async def main() -> None:
             exclude_repos=excluded_repos,
             exclude_langs=excluded_langs,
             ignore_forked_repos=ignore_forked_repos,
+            ignore_contrib_repos=ignore_contrib_repos,
         )
         await asyncio.gather(generate_languages(s), generate_overview(s))
 
