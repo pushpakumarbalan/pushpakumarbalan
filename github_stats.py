@@ -6,6 +6,8 @@ from typing import Dict, List, Optional, Set, Tuple, Any, cast
 
 import aiohttp
 import requests
+import ssl
+import certifi
 
 
 ###############################################################################
@@ -30,6 +32,9 @@ class Queries(object):
         self.access_token = access_token
         self.session = session
         self.semaphore = asyncio.Semaphore(max_connections)
+        # track paths we've already logged errors for to avoid spamming
+        self._seen_errors: Set[str] = set()
+        self._seen_202: Set[str] = set()
 
     async def query(self, generated_query: str) -> Dict:
         """
@@ -42,6 +47,9 @@ class Queries(object):
             "Authorization": f"Bearer {self.access_token}",
         }
         try:
+            # Ensure aiohttp uses system CA bundle from certifi to avoid
+            # macOS "certificate verify failed" issues in some venvs.
+            ssl_context = ssl.create_default_context(cafile=certifi.where())
             async with self.semaphore:
                 r_async = await self.session.post(
                     "https://api.github.com/graphql",
@@ -55,14 +63,16 @@ class Queries(object):
             print("aiohttp failed for GraphQL query")
             # Fall back on non-async requests
             async with self.semaphore:
+                # Use certifi bundle for requests too
                 r_requests = requests.post(
                     "https://api.github.com/graphql",
                     headers=headers,
                     json={"query": generated_query},
+                    verify=certifi.where(),
                 )
-                result = r_requests.json()
-                if result is not None:
-                    return result
+            result = r_requests.json()
+            if result is not None:
+                return result
         return dict()
 
     async def query_rest(self, path: str, params: Optional[Dict] = None) -> Dict:
@@ -73,14 +83,20 @@ class Queries(object):
         :return: deserialized REST JSON output
         """
 
-        for _ in range(60):
-            headers = {
-                "Authorization": f"token {self.access_token}",
-            }
-            if params is None:
-                params = dict()
-            if path.startswith("/"):
-                path = path[1:]
+        # Allow override of retry attempts via env var, default to 5
+        try:
+            max_retries = int(os.getenv("MAX_202_RETRIES", "5"))
+        except Exception:
+            max_retries = 5
+
+        headers = {"Authorization": f"token {self.access_token}"}
+        if params is None:
+            params = dict()
+        if path.startswith("/"):
+            path = path[1:]
+
+        for attempt in range(max_retries):
+            backoff = min(2 ** attempt, 30)
             try:
                 async with self.semaphore:
                     r_async = await self.session.get(
@@ -89,31 +105,48 @@ class Queries(object):
                         params=tuple(params.items()),
                     )
                 if r_async.status == 202:
-                    # print(f"{path} returned 202. Retrying...")
-                    print(f"A path returned 202. Retrying...")
-                    await asyncio.sleep(2)
+                    if path not in self._seen_202:
+                        print(f"A path returned 202 for {path}. Retrying up to {max_retries} times...")
+                        self._seen_202.add(path)
+                    await asyncio.sleep(backoff)
                     continue
 
                 result = await r_async.json()
                 if result is not None:
                     return result
-            except:
-                print("aiohttp failed for rest query")
-                # Fall back on non-async requests
-                async with self.semaphore:
+            except Exception as e:
+                # Log aiohttp failure once per path to avoid flooding logs
+                if path not in self._seen_errors:
+                    print(f"aiohttp failed for rest query {path}: {e}")
+                    self._seen_errors.add(path)
+                # Fall back to synchronous requests with certifi bundle
+                try:
                     r_requests = requests.get(
                         f"https://api.github.com/{path}",
                         headers=headers,
                         params=tuple(params.items()),
+                        verify=certifi.where(),
+                        timeout=10,
                     )
                     if r_requests.status_code == 202:
-                        print(f"A path returned 202. Retrying...")
-                        await asyncio.sleep(2)
+                        if path not in self._seen_202:
+                            print(f"A path returned 202 for {path}. Retrying up to {max_retries} times...")
+                            self._seen_202.add(path)
+                        await asyncio.sleep(backoff)
                         continue
                     elif r_requests.status_code == 200:
                         return r_requests.json()
-        # print(f"There were too many 202s. Data for {path} will be incomplete.")
-        print("There were too many 202s. Data for this repository will be incomplete.")
+                except Exception as e2:
+                    if path not in self._seen_errors:
+                        print(f"requests fallback failed for {path}: {e2}")
+                        self._seen_errors.add(path)
+                    await asyncio.sleep(backoff)
+                    continue
+
+        # Too many retries or still 202; return incomplete data
+        if path not in self._seen_202:
+            print(f"There were too many 202s for {path}. Data for this repository will be incomplete.")
+            self._seen_202.add(path)
         return dict()
 
     @staticmethod
@@ -226,9 +259,12 @@ query {
       contributionCalendar {{
         totalContributions
       }}
+      totalPullRequestContributions
+      totalIssueContributions
+      totalPullRequestReviewContributions
     }}
-"""
 
+"""
     @classmethod
     def all_contribs(cls, years: List[str]) -> str:
         """
@@ -258,6 +294,7 @@ class Stats(object):
         exclude_repos: Optional[Set] = None,
         exclude_langs: Optional[Set] = None,
         ignore_forked_repos: bool = False,
+        ignore_contrib_repos: bool = False,
     ):
         self.username = username
         self._ignore_forked_repos = ignore_forked_repos
@@ -273,6 +310,10 @@ class Stats(object):
         self._repos: Optional[Set[str]] = None
         self._lines_changed: Optional[Tuple[int, int]] = None
         self._views: Optional[int] = None
+        self._total_pull_requests: Optional[int] = None
+        self._total_issues_created: Optional[int] = None
+        self._total_code_reviews: Optional[int] = None
+        self._ignore_contrib_repos = ignore_contrib_repos
 
     async def to_str(self) -> str:
         """
@@ -283,17 +324,25 @@ class Stats(object):
             [f"{k}: {v:0.4f}%" for k, v in languages.items()]
         )
         lines_changed = await self.lines_changed
-        return f"""Name: {await self.name}
-Stargazers: {await self.stargazers:,}
-Forks: {await self.forks:,}
-All-time contributions: {await self.total_contributions:,}
-Repositories with contributions: {len(await self.repos)}
-Lines of code added: {lines_changed[0]:,}
-Lines of code deleted: {lines_changed[1]:,}
-Lines of code changed: {lines_changed[0] + lines_changed[1]:,}
-Project page views: {await self.views:,}
-Languages:
-  - {formatted_languages}"""
+
+        # The 'Total code reviews' line has been removed temporarily —
+        # it was reporting 0 and will be re-enabled by the owner later.
+        parts = [
+            f"Name: {await self.name}",
+            f"Stargazers: {await self.stargazers:,}",
+            f"Forks: {await self.forks:,}",
+            f"All-time contributions: {await self.total_contributions:,}",
+            f"Total pull requests: {await self.total_pull_requests:,}",
+            f"Total issues created: {await self.total_issues_created:,}",
+            f"Repositories with contributions: {len(await self.repos)}",
+            f"Lines of code added: {lines_changed[0]:,}",
+            f"Lines of code deleted: {lines_changed[1]:,}",
+            f"Lines of code changed: {lines_changed[0] + lines_changed[1]:,}",
+            f"Project page views: {await self.views:,}",
+            "Languages:",
+            "  - " + formatted_languages,
+        ]
+        return "\n".join(parts)
 
     async def get_stats(self) -> None:
         """
@@ -334,7 +383,8 @@ Languages:
             )
 
             repos = owned_repos.get("nodes", [])
-            if not self._ignore_forked_repos:
+            # Optionally include repositories the user contributed to
+            if not getattr(self, "_ignore_contrib_repos", False):
                 repos += contrib_repos.get("nodes", [])
 
             for repo in repos:
@@ -475,10 +525,92 @@ Languages:
         return cast(int, self._total_contributions)
 
     @property
+    async def total_pull_requests(self) -> int:
+        """:
+        :return: total number of pull requests created by the user (all years)
+        """
+        if self._total_pull_requests is not None:
+            return self._total_pull_requests
+
+        self._total_pull_requests = 0
+        years = (
+            (await self.queries.query(Queries.contrib_years()))
+            .get("data", {})
+            .get("viewer", {})
+            .get("contributionsCollection", {})
+            .get("contributionYears", [])
+        )
+        by_year = (
+            (await self.queries.query(Queries.all_contribs(years)))
+            .get("data", {})
+            .get("viewer", {})
+            .values()
+        )
+        for year in by_year:
+            self._total_pull_requests += year.get("totalPullRequestContributions", 0)
+        return cast(int, self._total_pull_requests)
+
+    @property
+    async def total_issues_created(self) -> int:
+        """:
+        :return: total number of issues created by the user (all years)
+        """
+        if self._total_issues_created is not None:
+            return self._total_issues_created
+
+        self._total_issues_created = 0
+        years = (
+            (await self.queries.query(Queries.contrib_years()))
+            .get("data", {})
+            .get("viewer", {})
+            .get("contributionsCollection", {})
+            .get("contributionYears", [])
+        )
+        by_year = (
+            (await self.queries.query(Queries.all_contribs(years)))
+            .get("data", {})
+            .get("viewer", {})
+            .values()
+        )
+        for year in by_year:
+            self._total_issues_created += year.get("totalIssueContributions", 0)
+        return cast(int, self._total_issues_created)
+
+    @property
+    async def total_code_reviews(self) -> int:
+        """:
+        :return: total number of code reviews (pull request reviews) by the user
+        """
+        if self._total_code_reviews is not None:
+            return self._total_code_reviews
+
+        self._total_code_reviews = 0
+        years = (
+            (await self.queries.query(Queries.contrib_years()))
+            .get("data", {})
+            .get("viewer", {})
+            .get("contributionsCollection", {})
+            .get("contributionYears", [])
+        )
+        by_year = (
+            (await self.queries.query(Queries.all_contribs(years)))
+            .get("data", {})
+            .get("viewer", {})
+            .values()
+        )
+        for year in by_year:
+            self._total_code_reviews += year.get("totalPullRequestReviewContributions", 0)
+        return cast(int, self._total_code_reviews)
+
+    @property
     async def lines_changed(self) -> Tuple[int, int]:
         """
         :return: count of total lines added, removed, or modified by the user
         """
+        # Allow skipping expensive endpoints (contributors/traffic) for fast runs
+        if os.getenv("SKIP_EXPENSIVE"):
+            return (0, 0)
+
         if self._lines_changed is not None:
             return self._lines_changed
         additions = 0
@@ -508,6 +640,10 @@ Languages:
         Note: only returns views for the last 14 days (as-per GitHub API)
         :return: total number of page views the user's projects have received
         """
+        # Allow skipping expensive endpoints (contributors/traffic) for fast runs
+        if os.getenv("SKIP_EXPENSIVE"):
+            return 0
+
         if self._views is not None:
             return self._views
 
@@ -536,7 +672,11 @@ async def main() -> None:
         raise RuntimeError(
             "ACCESS_TOKEN and GITHUB_ACTOR environment variables cannot be None!"
         )
-    async with aiohttp.ClientSession() as session:
+    # Create an aiohttp session that uses certifi's CA bundle to avoid
+    # macOS venv SSL verification failures.
+    ssl_context = ssl.create_default_context(cafile=certifi.where())
+    connector = aiohttp.TCPConnector(ssl=ssl_context)
+    async with aiohttp.ClientSession(connector=connector) as session:
         s = Stats(user, access_token, session)
         print(await s.to_str())
 
