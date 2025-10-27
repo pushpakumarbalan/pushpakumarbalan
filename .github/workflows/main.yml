@@ -1,3 +1,59 @@
+# name: Generate Stats Images
+
+# on:
+#   push:
+#     branches: [ master ]
+#   schedule:
+#     - cron: "5 0 * * *"
+#   workflow_dispatch:
+
+# permissions:
+#   contents: write
+
+# jobs:
+#   build:
+#     runs-on: ubuntu-latest
+
+#     steps:
+#     # Check out repository under $GITHUB_WORKSPACE, so the job can access it
+#     - uses: actions/checkout@v3
+
+#     # Run using Python 3.8 for consistency and aiohttp
+#     - name: Set up Python 3.8
+#       uses: actions/setup-python@v4
+#       with:
+#         python-version: '3.8'
+#         architecture: 'x64'
+#         cache: 'pip'
+
+#     # Install dependencies with `pip`
+#     - name: Install requirements
+#       run: |
+#         python3 -m pip install --upgrade pip setuptools wheel
+#         python3 -m pip install -r requirements.txt
+
+#     # Generate all statistics images
+#     - name: Generate images
+#       run: |
+#         python3 --version
+#         python3 generate_images.py
+#       env:
+#         ACCESS_TOKEN: ${{ secrets.ACCESS_TOKEN }}
+#         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+#         EXCLUDED: ${{ secrets.EXCLUDED }}
+#         EXCLUDED_LANGS: ${{ secrets.EXCLUDED_LANGS }}
+#         EXCLUDE_FORKED_REPOS: true
+
+#     # Commit all changed files to the repository
+#     - name: Commit to the repo
+#       run: |
+#         git config --global user.name "pushpakumarbalan/github-stats"
+#         git config --global user.email "github-stats[bot]@pushpakumar02.github.io"
+#         git add .
+#         # Force the build to succeed, even if no files were changed
+#         git commit -m 'Update generated files' || true
+#         git push
+
 name: Generate Stats Images
 
 on:
@@ -8,48 +64,98 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: write    # required only if you plan to commit generated files back
 
 jobs:
-  build:
+  generate:
     runs-on: ubuntu-latest
+    env:
+      # Use the repository secret you already added (make sure it is a PAT with repo/read)
+      ACCESS_TOKEN: ${{ secrets.ACCESS_TOKEN }}
+      # Make the actor explicit (use your username)
+      GITHUB_ACTOR: pushpakumarbalan
+      # Make runs deterministic; set to "1" if you want owned-only
+      EXCLUDE_CONTRIBS: "0"
+      EXCLUDE_FORKED_REPOS: "0"
+      # Increase retry for 202 responses (recommended)
+      MAX_202_RETRIES: "10"
+      SKIP_EXPENSIVE: "0"    # set to "1" for fast runs that skip traffic/contributors
 
     steps:
-    # Check out repository under $GITHUB_WORKSPACE, so the job can access it
-    - uses: actions/checkout@v3
+      - name: Checkout
+        uses: actions/checkout@v4
 
-    # Run using Python 3.8 for consistency and aiohttp
-    - name: Set up Python 3.8
-      uses: actions/setup-python@v4
-      with:
-        python-version: '3.8'
-        architecture: 'x64'
-        cache: 'pip'
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
 
-    # Install dependencies with `pip`
-    - name: Install requirements
-      run: |
-        python3 -m pip install --upgrade pip setuptools wheel
-        python3 -m pip install -r requirements.txt
+      - name: Install requirements
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
 
-    # Generate all statistics images
-    - name: Generate images
-      run: |
-        python3 --version
-        python3 generate_images.py
-      env:
-        ACCESS_TOKEN: ${{ secrets.ACCESS_TOKEN }}
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        EXCLUDED: ${{ secrets.EXCLUDED }}
-        EXCLUDED_LANGS: ${{ secrets.EXCLUDED_LANGS }}
-        EXCLUDE_FORKED_REPOS: true
+      - name: Echo debug info (no tokens printed)
+        run: |
+          echo "GITHUB_ACTOR=${GITHUB_ACTOR}"
+          echo "EXCLUDE_CONTRIBS=${EXCLUDE_CONTRIBS}"
+          echo "EXCLUDE_FORKED_REPOS=${EXCLUDE_FORKED_REPOS}"
+          echo "MAX_202_RETRIES=${MAX_202_RETRIES}"
+          # confirm certifi installed
+          python -c "import certifi; print('certifi OK', certifi.where())"
 
-    # Commit all changed files to the repository
-    - name: Commit to the repo
-      run: |
-        git config --global user.name "pushpakumarbalan/github-stats"
-        git config --global user.email "github-stats[bot]@pushpakumar02.github.io"
-        git add .
-        # Force the build to succeed, even if no files were changed
-        git commit -m 'Update generated files' || true
-        git push
+      - name: Generate images and repo dump
+        run: |
+          # generate images (this may log 202/204 messages if GitHub is computing stats)
+          python generate_images.py
+
+          # create a per-repo CSV for debugging (this will be uploaded as an artifact)
+          python - <<'PY'
+import os,asyncio,ssl,certifi,aiohttp,csv
+from github_stats import Queries
+async def main():
+    token=os.getenv('ACCESS_TOKEN'); user=os.getenv('GITHUB_ACTOR')
+    ssl_context=ssl.create_default_context(cafile=certifi.where())
+    conn=aiohttp.TCPConnector(ssl=ssl_context)
+    async with aiohttp.ClientSession(connector=conn) as session:
+        q=Queries(user, token, session)
+        next_owned=None; next_contrib=None
+        rows=[]
+        while True:
+            raw=await q.query(Queries.repos_overview(owned_cursor=next_owned, contrib_cursor=next_contrib))
+            v=raw.get('data',{}).get('viewer',{})
+            owned=v.get('repositories',{}); contrib=v.get('repositoriesContributedTo',{})
+            for r in (owned.get('nodes',[]) or []):
+                rows.append(['owned', r.get('nameWithOwner'), r.get('stargazers',{}).get('totalCount',0), r.get('forkCount',0)])
+            for r in (contrib.get('nodes',[]) or []):
+                rows.append(['contrib', r.get('nameWithOwner'), r.get('stargazers',{}).get('totalCount',0), r.get('forkCount',0)])
+            if owned.get('pageInfo',{}).get('hasNextPage') or contrib.get('pageInfo',{}).get('hasNextPage'):
+                next_owned=owned.get('pageInfo',{}).get('endCursor')
+                next_contrib=contrib.get('pageInfo',{}).get('endCursor')
+            else:
+                break
+        os.makedirs('generated', exist_ok=True)
+        with open('generated/repo_breakdown.csv','w',newline='') as fh:
+            w=csv.writer(fh)
+            w.writerow(['source','repo','stars','forks'])
+            w.writerows(rows)
+asyncio.run(main())
+PY
+
+      - name: Upload generated artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: gh-stats-generated
+          path: generated/**
+
+      # Optional: Commit generated files back to the repo (enable only if desired)
+      # - name: Commit generated files
+      #   run: |
+      #     git config --global user.name "github-actions[bot]"
+      #     git config --global user.email "github-actions[bot]@users.noreply.github.com"
+      #     git add generated/*
+      #     git commit -m "Update generated stats images" || echo "No changes to commit"
+      #     git push
+      #   env:
+      #     # If committing, use a PAT with repo write access from secrets (not GITHUB_TOKEN)
+      #     ACCESS_TOKEN: ${{ secrets.ACCESS_TOKEN }}
