@@ -150,11 +150,11 @@ class Queries(object):
         return dict()
 
     @staticmethod
-    def repos_overview(
-        contrib_cursor: Optional[str] = None, owned_cursor: Optional[str] = None
-    ) -> str:
+    def repos_overview(owned_cursor: Optional[str] = None) -> str:
         """
-        :return: GraphQL query with overview of user repositories
+        :return: GraphQL query with overview of repositories owned by the user.
+        Only non-fork, viewer-owned repositories are requested so that all
+        derived stats reflect the user's own projects.
         """
         return f"""{{
   viewer {{
@@ -167,43 +167,8 @@ class Queries(object):
             direction: DESC
         }},
         isFork: false,
+        affiliations: [OWNER],
         after: {"null" if owned_cursor is None else '"'+ owned_cursor +'"'}
-    ) {{
-      pageInfo {{
-        hasNextPage
-        endCursor
-      }}
-      nodes {{
-        nameWithOwner
-        stargazers {{
-          totalCount
-        }}
-        forkCount
-        languages(first: 10, orderBy: {{field: SIZE, direction: DESC}}) {{
-          edges {{
-            size
-            node {{
-              name
-              color
-            }}
-          }}
-        }}
-      }}
-    }}
-    repositoriesContributedTo(
-        first: 100,
-        includeUserRepositories: false,
-        orderBy: {{
-            field: UPDATED_AT,
-            direction: DESC
-        }},
-        contributionTypes: [
-            COMMIT,
-            PULL_REQUEST,
-            REPOSITORY,
-            PULL_REQUEST_REVIEW
-        ]
-        after: {"null" if contrib_cursor is None else '"'+ contrib_cursor +'"'}
     ) {{
       pageInfo {{
         hasNextPage
@@ -249,7 +214,10 @@ query {
     def contribs_by_year(year: str) -> str:
         """
         :param year: year to query for
-        :return: portion of a GraphQL query with desired info for a given year
+        :return: portion of a GraphQL query with desired info for a given year.
+        These are account-wide totals representing only the user's own
+        contributions (commits, pull requests, issues, reviews) across every
+        repository, including external repos they contributed to.
         """
         return f"""
     year{year}: contributionsCollection(
@@ -356,12 +324,9 @@ class Stats(object):
         exclude_langs_lower = {x.lower() for x in self._exclude_langs}
 
         next_owned = None
-        next_contrib = None
         while True:
             raw_results = await self.queries.query(
-                Queries.repos_overview(
-                    owned_cursor=next_owned, contrib_cursor=next_contrib
-                )
+                Queries.repos_overview(owned_cursor=next_owned)
             )
             raw_results = raw_results if raw_results is not None else {}
 
@@ -373,21 +338,16 @@ class Stats(object):
                     .get("login", "No Name")
                 )
 
-            contrib_repos = (
-                raw_results.get("data", {})
-                .get("viewer", {})
-                .get("repositoriesContributedTo", {})
-            )
             owned_repos = (
                 raw_results.get("data", {}).get("viewer", {}).get("repositories", {})
             )
 
-            repos = owned_repos.get("nodes", [])
-            # Optionally include repositories the user contributed to
-            if not getattr(self, "_ignore_contrib_repos", False):
-                repos += contrib_repos.get("nodes", [])
-
-            for repo in repos:
+            # Only consider repositories the viewer owns/created. The
+            # `repositories(isFork: false)` query already excludes forks, and we
+            # deliberately ignore `repositoriesContributedTo` so that stars,
+            # forks, languages, views and lines all reflect the user's own
+            # repos rather than other people's projects.
+            for repo in owned_repos.get("nodes", []):
                 if repo is None:
                     continue
                 name = repo.get("nameWithOwner")
@@ -412,14 +372,9 @@ class Stats(object):
                             "color": lang.get("node", {}).get("color"),
                         }
 
-            if owned_repos.get("pageInfo", {}).get(
-                "hasNextPage", False
-            ) or contrib_repos.get("pageInfo", {}).get("hasNextPage", False):
+            if owned_repos.get("pageInfo", {}).get("hasNextPage", False):
                 next_owned = owned_repos.get("pageInfo", {}).get(
                     "endCursor", next_owned
-                )
-                next_contrib = contrib_repos.get("pageInfo", {}).get(
-                    "endCursor", next_contrib
                 )
             else:
                 break
@@ -499,7 +454,9 @@ class Stats(object):
     @property
     async def total_contributions(self) -> int:
         """
-        :return: count of user's total contributions as defined by GitHub
+        :return: count of the user's own contributions (commits, PRs, issues,
+        reviews) across all repositories, including external repos they
+        contributed to
         """
         if self._total_contributions is not None:
             return self._total_contributions
@@ -527,7 +484,7 @@ class Stats(object):
     @property
     async def total_pull_requests(self) -> int:
         """:
-        :return: total number of pull requests created by the user (all years)
+        :return: total pull requests the user created across all repositories
         """
         if self._total_pull_requests is not None:
             return self._total_pull_requests
@@ -553,7 +510,7 @@ class Stats(object):
     @property
     async def total_issues_created(self) -> int:
         """:
-        :return: total number of issues created by the user (all years)
+        :return: total issues the user created across all repositories
         """
         if self._total_issues_created is not None:
             return self._total_issues_created
@@ -579,7 +536,7 @@ class Stats(object):
     @property
     async def total_code_reviews(self) -> int:
         """:
-        :return: total number of code reviews (pull request reviews) by the user
+        :return: total code reviews the user made across all repositories
         """
         if self._total_code_reviews is not None:
             return self._total_code_reviews
